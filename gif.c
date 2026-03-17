@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Security limits: reject crafted GIFs that would cause huge allocations. */
+#define GIF_MAX_DIM        16384u               /* max pixels per axis       */
+#define GIF_MAX_LZW_BYTES  (64u * 1024u * 1024u) /* max LZW bytes per frame */
+
 /* -----------------------------------------------------------------------
  * Bit-reader for packed LZW bitstream
  * ----------------------------------------------------------------------- */
@@ -113,14 +117,14 @@ static int lzw_push(lzw_t *lzw, int code)
  * Returns the number of pixels written.
  */
 static int lzw_decode(const uint8_t *src, size_t src_len,
-                      uint8_t *dst, int dst_len, int min_size)
+                      uint8_t *dst, size_t dst_len, int min_size)
 {
     if (min_size < 2 || min_size > 11)
         return 0;
 
     lzw_t        lzw;
     bit_reader_t br;
-    int          written   = 0;
+    size_t       written   = 0;
     int          prev_code = -1;
 
     lzw_init(&lzw, min_size);
@@ -188,7 +192,7 @@ static int lzw_decode(const uint8_t *src, size_t src_len,
         prev_code = code;
     }
 
-    return written;
+    return (int)written;
 }
 
 /* -----------------------------------------------------------------------
@@ -234,15 +238,24 @@ static uint16_t gr_u16(gif_reader_t *gr)
 /*
  * Read all GIF sub-blocks (length-prefixed chunks terminated by 0x00) into
  * gr->buf.  Returns the total number of data bytes read.
+ * Accumulation is capped at GIF_MAX_LZW_BYTES to prevent DoS via crafted
+ * streams with enormous sub-block chains.
  */
 static size_t gr_read_subblocks(gif_reader_t *gr)
 {
     gr->buf_len = 0;
     uint8_t bsz;
     while (gr_byte(gr, &bsz) && bsz > 0) {
+        /* Reject if adding this block would exceed the hard cap. */
+        if (gr->buf_len > GIF_MAX_LZW_BYTES - bsz)
+            break;
         size_t needed = gr->buf_len + bsz;
         if (needed > gr->buf_cap) {
-            gr->buf_cap = needed * 2 + 256;
+            /* Double capacity, but guard against size_t overflow. */
+            size_t new_cap = (needed <= GIF_MAX_LZW_BYTES / 2)
+                             ? needed * 2 + 256
+                             : GIF_MAX_LZW_BYTES;
+            gr->buf_cap = new_cap;
             gr->buf     = xrealloc(gr->buf, gr->buf_cap);
         }
         if (!gr_bytes(gr, gr->buf + gr->buf_len, bsz))
@@ -303,6 +316,13 @@ gif_image_t *gif_load(const char *filename)
         fclose(fp);
         return NULL;
     }
+    if (screen_w > GIF_MAX_DIM || screen_h > GIF_MAX_DIM) {
+        fprintf(stderr, "%s: GIF dimensions too large (%ux%u, max %u)\n",
+                filename, (unsigned)screen_w, (unsigned)screen_h,
+                (unsigned)GIF_MAX_DIM);
+        fclose(fp);
+        return NULL;
+    }
 
     int has_gct  = (lsd_packed >> 7) & 1;
     int gct_size = 2 << (lsd_packed & 0x07); /* 2..256 */
@@ -323,7 +343,7 @@ gif_image_t *gif_load(const char *filename)
     img->loop_count = 1; /* default: play once */
 
     /* Canvas for compositing and one backup for disposal method 3 */
-    size_t canvas_bytes = (size_t)screen_w * screen_h * 4;
+    size_t canvas_bytes = (size_t)screen_w * (size_t)screen_h * 4u;
     uint8_t *canvas      = xcalloc(canvas_bytes, 1);
     uint8_t *prev_canvas = xcalloc(canvas_bytes, 1);
 
@@ -433,20 +453,20 @@ gif_image_t *gif_load(const char *filename)
             fh = (int)screen_h - fy;
 
         {
-            int npixels = fw * fh;
-            uint8_t *indices = xmalloc((size_t)npixels);
+            size_t npixels = (size_t)fw * (size_t)fh;
+            uint8_t *indices = xmalloc(npixels);
             lzw_decode(gr.buf, gr.buf_len, indices, npixels,
                        (int)min_code_size);
 
             /* De-interlace if the interlace flag is set */
             if (interlaced) {
                 static const int passes[4][2] = {{0,8},{4,8},{2,4},{1,2}};
-                uint8_t *deint = xmalloc((size_t)npixels);
+                uint8_t *deint = xmalloc(npixels);
                 int src_row   = 0;
                 for (int p = 0; p < 4; p++) {
                     for (int y = passes[p][0]; y < fh; y += passes[p][1]) {
-                        memcpy(deint + y * fw,
-                               indices + src_row * fw,
+                        memcpy(deint + (size_t)y * (size_t)fw,
+                               indices + (size_t)src_row * (size_t)fw,
                                (size_t)fw);
                         src_row++;
                     }
